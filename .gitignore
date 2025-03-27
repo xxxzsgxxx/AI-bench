@@ -1,0 +1,22 @@
+# 系统生成文件
+*.log
+*.tmp
+*.tar.gz
+*.swp
+*.swo
+
+# 日志目录
+sysinfo_*
+
+# 编辑器文件
+.DS_Store
+.idea/
+.vscode/
+
+# 测试数据
+/performance/
+/storage/
+/network/
+
+# 本地调试文件
+local_settings.sh

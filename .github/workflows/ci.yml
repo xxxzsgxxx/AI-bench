@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up ShellCheck
+        run: sudo apt-get install -y shellcheck
+        
+      - name: Check script permissions
+        run: chmod +x *.sh modules/**/*.sh examples/*.sh
+        
+      - name: Run ShellCheck
+        run: shellcheck --severity=warning ./*.sh modules/**/*.sh
+        
+      - name: Execute test cases
+        run: ./examples/hardware_demo.sh
