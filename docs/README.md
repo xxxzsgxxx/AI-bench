@@ -45,6 +45,6 @@ git push -f origin your-branch
 
 ## 快速开始
 ```bash
-./install_dependencies.sh
+./install.sh
 ./main.sh --module=hardware
 ```

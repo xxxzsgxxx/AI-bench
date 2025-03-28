@@ -14,13 +14,16 @@ init_logging() {
 # 执行环境初始化
 execute_init() {
     echo "=== 系统环境初始化 ==="
-    ./install_dependencies.sh | tee "${LOG_BASE}/runtime_logs/init.log"
+    ./install.sh | tee "${LOG_BASE}/runtime_logs/init.log"
 }
 
 # 执行系统信息采集
 execute_sysinfo() {
-    echo "\n=== 开始系统信息采集 ==="
-    ./system_profile.sh | tee "${LOG_BASE}/runtime_logs/sysinfo.log"
+    echo "正在执行系统信息采集..."
+# 统一硬件检测调用方式
+lshw -short 2>&1 | tee -a ${LOG_BASE}/runtime_logs/hardware/system_hardware.log
+sudo dmidecode -t bios 2>&1 | tee -a ${LOG_BASE}/runtime_logs/hardware/bios_info.log || echo "警告: 需要root权限获取BIOS信息"
+    ./sysinfo/sysinfo_collector.sh | tee "${LOG_BASE}/runtime_logs/sysinfo.log"
 }
 
 # 执行基准测试

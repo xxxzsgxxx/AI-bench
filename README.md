@@ -13,7 +13,7 @@
 git clone https://github.com/your-account/AI-bench.git
 cd AI-bench
 chmod +x *.sh
-./install_dependencies.sh
+./install.sh
 ./main.sh
 ```
 
