@@ -14,9 +14,9 @@ sysinfo_*
 .vscode/
 
 # 测试数据
-/performance/
-/storage/
-/network/
+#/performance/
+#/storage/
+#/network/
 
 # 本地调试文件
 local_settings.sh
