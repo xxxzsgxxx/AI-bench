@@ -14,12 +14,16 @@ CUDA_SAMPLE_DIR="/root/cuda-samples/build/Samples"  # 默认安装路径
     fi
 
 # 检测必要工具存在性
+apt install -y ipmitool hwinfo dmidecode smartmontools nvme-cli nvtop stress-ng fio lshw hwloc
+
+    command -v stress-ng >/dev/null 2>&1 || { echo >&2 "需要安装stress-ng压力测试工具"; return 1; }
+    command -v fio >/dev/null 2>&1 || { echo >&2 "需要安装fio磁盘压力测试工具"; return 1; }
     command -v ipmitool >/dev/null 2>&1 || { echo >&2 "需要安装ipmitool工具"; return 1; }
     command -v /root/gpu-burn/gpu_burn >/dev/null 2>&1 || { echo >&2 "需要安装gpu_burn测试工具"; return 1; }
     command -v hwinfo >/dev/null 2>&1 || { echo >&2 "需要安装hwinfo硬件检测工具"; return 1; }
     command -v dmidecode >/dev/null 2>&1 || { echo >&2 "需要安装dmidecode工具"; return 1; }
-    command -v smartctl >/dev/null 2>&1 || { echo >&2 "需要安装smartctl工具"; return 1; }
-    command -v nvme >/dev/null 2>&1 || { echo >&2 "需要安装nvme工具"; return 1; }
+    command -v smartctl >/dev/null 2>&1 || { echo >&2 "需要安装 smartmontools 工具"; return 1; }
+    command -v nvme >/dev/null 2>&1 || { echo >&2 "需要安装 nvme-cli 工具"; return 1; }
     command -v nvtop >/dev/null 2>&1 || { echo >&2 "需要安装nvtop工具"; return 1; }
 
 # 初始化日志系统
@@ -132,24 +136,30 @@ test08() {
 test09() {
     echo "执行阶段09：GPU压力测试 [$(date +'%Y-%m-%d %H:%M:%S')]"
     # 启动gpu_burn一小时测试
-    cd ~/gpu-burn/; ./gpu_burn 3600 | tee ${LOG_BASE}/GPU-GURN-3600.log 2>&1 &
+    cd ~/gpu-burn/; ./gpu_burn 3600 | tee "${LOG_BASE}/GPU-BURN-3600.log" 2>&1 &
     GPU_BURN_PID=$!
 
     # 30分钟后启动高负载sensor采集
+    declare -a BG_PIDS
     (
         sleep 1800  # 等待30分钟
         echo "=== 启动高负载sensor采集 [$(date +'%Y-%m-%d %H:%M:%S')] ==="
         while true; do
-            ipmitool sensor list >> ${LOG_BASE}/monitor_logs/highload_sensors.log
-            sleep 60  # 每5分钟采集一次
+            ipmitool sensor list >> "${LOG_BASE}/monitor_logs/highload_sensors.log"
+            sleep 60  # 每1分钟采集一次
         done
     ) &
-    IPMI_PGID=$!
-    disown -h $IPMI_PGID  # 防止被清理函数误杀
+    BG_PGID+=($!)
+    disown -h $BG_PGID  # 防止被清理函数误杀
+  
+    wait ${GPU_BURN_PID}
+    kill ${BG_PID[@]}
+    cleanup_all_processes
 
-    wait $GPU_BURN_PID
-    kill $IPMI_PID
+
 }
+
+
 
 
 
@@ -181,7 +191,7 @@ nvme smart-log /dev/nvme0n1 > ${LOG_BASE}/sysinfo/nvme_smart_log.log
 nvme id-ctrl /dev/nvme0n1 > ${LOG_BASE}/sysinfo/nvme_id_ctrl.log
 nvme id-ns /dev/nvme0n1 > ${LOG_BASE}/sysinfo/nvme_id_ns.log
 
-/root/SCELNX_64 /o /s  ${LOG_BASE}/sysinfo/BIOS_setup.log
+/root/SCELNX_64 /o /s  ${LOG_BASE}/sysinfo/BIOS_setup.log 2>&1 || true
 ipmitool fru print > ${LOG_BASE}/sysinfo/fru_info.log
 ipmitool lan print  > ${LOG_BASE}/sysinfo/lan_info.log
 ipmitool sensor list > ${LOG_BASE}/sysinfo/sensor_info.log
@@ -288,6 +298,25 @@ stop_monitoring() {
     gpu_util=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | awk '{sum+=$1} END {if(NR>0) printf "%.1f", sum/NR; else print "N/A"}')
 }
 
+cleanup_all_processes() {
+    echo "清理所有测试进程..."
+    stop_monitoring
+    
+    # 终止所有可能的残留进程
+    pkill -f "testGPU.sh" || true
+    pkill -f "tee" || true
+    pkill -f "bandwidthTest" || true
+    pkill -f "gpu_burn" || true
+    pkill -f "bash -vx" || true
+    
+    # 杀死整个进程组
+    kill -- -$$ 2>/dev/null || true
+    
+    # 确保所有后台作业完成
+    jobs -p | xargs -r kill
+    wait 2>/dev/null
+}
+
 
 execute_benchmark() {
     echo -e "\n=== 启动七阶段性能测试 [$(date +'%Y-%m-%d %H:%M:%S')] ==="
@@ -327,7 +356,8 @@ main() {
     }
     
     # 注册信号捕获
-    trap cleanup SIGINT SIGTERM
+    #trap cleanup SIGINT SIGTERM
+    trap 'cleanup_all_processes; exit' SIGINT SIGTERM EXIT
     
     parse_arguments "$@" 
     init_logging
