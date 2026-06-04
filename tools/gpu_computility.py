@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-GPU Computility Test (v20)
-- PRECISION_INFO unified matrix
-- FP8 _scaled_mm return value fix (tuple vs tensor)
-- bf8 precision support
-- Unified GEMM dispatch (eliminates if/else chains)
-- Binary-search matrix auto-scaling
-- --matrix-size / --precisions CLI flags
-- ETA progress in benchmark
-- JSON output for machine consumption
-- Reference GPU specs with bus_width
-- DmonMonitor auto-restart
-- Type hints
+GPU Computility Test (v21)
+- v21 fixes:
+  - Fix UnboundLocalError in OOM path (finally del a,b on unbound vars)
+  - Fix auto_scale_matrix memory estimation for fp8/bf8/int8 (used bytes=1 but input is float32)
+  - Fix compute_capability_to_cores SM 8.0 (A100) returning 128 instead of 64 cores/SM
+  - Fix tf32 precision detection (allow_tf32 not set during detection)
+  - Replace time.time() with time.monotonic() for robust duration timing
+  - Cache get_phys_idx_from_torch results (avoid repeated subprocess calls)
+  - Remove dead it_cnt parameter from _effective_bw
+  - Fix dmon header line parsing (was dead code, never parsed column names)
+  - Include matrix_size in JSON output
 """
 from __future__ import annotations
 
@@ -91,11 +90,17 @@ def print_reference_specs(gpu_name: str) -> None:
 # ================= 辅助函数 =================
 def compute_capability_to_cores(major: int, minor: int, device: torch.device) -> int:
     mp = torch.cuda.get_device_properties(device).multi_processor_count
-    mapping = {80: 128, 86: 128, 87: 128, 89: 128, 90: 128}
+    # A100 (compute capability 8.0) 每 SM 有 64 个 CUDA 核心
+    # Ada Lovelace (8.6, 8.7), H100 (8.9), Blackwell (9.0) 每 SM 128 核心
+    mapping = {80: 64, 86: 128, 87: 128, 89: 128, 90: 128}
     return mp * mapping.get(10 * major + minor, 64)
 
 
+_PHYS_IDX_CACHE: Dict[int, Optional[int]] = {}
+
 def get_phys_idx_from_torch(torch_dev_idx: int) -> Optional[int]:
+    if torch_dev_idx in _PHYS_IDX_CACHE:
+        return _PHYS_IDX_CACHE[torch_dev_idx]
     props = torch.cuda.get_device_properties(torch_dev_idx)
     tuuid = str(props.uuid).replace('GPU-', '')
     try:
@@ -106,9 +111,12 @@ def get_phys_idx_from_torch(torch_dev_idx: int) -> Optional[int]:
         for line in out.split('\n'):
             parts = [x.strip() for x in line.split(',')]
             if len(parts) >= 2 and parts[1].replace('GPU-', '') == tuuid:
-                return int(parts[0])
+                result = int(parts[0])
+                _PHYS_IDX_CACHE[torch_dev_idx] = result
+                return result
     except Exception:
         pass
+    _PHYS_IDX_CACHE[torch_dev_idx] = None
     return None
 
 
@@ -305,6 +313,9 @@ def check_precision_support(prec: str, dev: torch.device) -> Tuple[bool, str, bo
     # 标准 dtype (fp64/fp32/fp16/bf16/tf32)
     try:
         dt = info['dtype']
+        # tf32 需要显式启用 allow_tf32，否则可能回退到普通 fp32
+        if prec == 'tf32':
+            torch.backends.cuda.matmul.allow_tf32 = True
         torch.manual_seed(GLOBAL_SEED)
         torch.cuda.manual_seed_all(GLOBAL_SEED)
         sz = 256
@@ -329,7 +340,7 @@ class DmonMonitor:
         self.lock = threading.Lock()
         self.running = False
         self._col_map: Dict[str, int] = {}
-        self._start_time = time.time()
+        self._start_time = time.monotonic()
         self._start()
 
     def _start(self) -> None:
@@ -409,7 +420,9 @@ def auto_scale_matrix(precision: str, device: torch.device, target_time: float =
     free_mem = total_mem - torch.cuda.memory_allocated(device)
 
     # Upper bound: ~70% of free memory, each element = bytes
-    elem_bytes = info['bytes']
+    # auto_scale_matrix 使用 torch.randn (float32) 创建张量，内存由 float32 决定
+    # 对 fp8/bf8/int8，info['bytes']=1 但实际输入张量占 4 字节/元素
+    elem_bytes = max(info['bytes'], 4)
     upper_est = int(((free_mem * 0.7) / (3 * elem_bytes)) ** 0.5)
     # Round down to nearest 256
     upper_est = max(upper_est // 256 * 256, 1024)
@@ -432,10 +445,10 @@ def auto_scale_matrix(precision: str, device: torch.device, target_time: float =
             b = torch.randn(mid, mid, device=device)
             torch.cuda.synchronize(device)
 
-            t0 = time.time()
+            t0 = time.monotonic()
             _ = dispatch_matmul(precision, a, b)
             torch.cuda.synchronize(device)
-            elapsed = time.time() - t0
+            elapsed = time.monotonic() - t0
 
             del a, b
             torch.cuda.empty_cache()
@@ -511,8 +524,8 @@ def benchmark(
         'mem_used_ratio': -1.0, 'effective_bw': -1.0,
     }
 
-    last_temp = time.time()
-    last_beat = time.time()
+    last_temp = time.monotonic()
+    last_beat = time.monotonic()
 
     def _get_status() -> Tuple[Any, ...]:
         temp = power = sm_clk = mem_clk = None
@@ -551,13 +564,13 @@ def benchmark(
             used_gb = total_gb = used_ratio = 0
         return temp, power, sm_clk, mem_clk, used_gb, total_gb, used_ratio
 
-    def _effective_bw(m: int, n: int, k: int, bytes_per_elem: float, elapsed_sec: float, it_cnt: int) -> float:
-        total_bytes = (m * k + k * n + m * n) * bytes_per_elem * it_cnt
+    def _effective_bw(m: int, n: int, k: int, bytes_per_elem: float, elapsed_sec: float) -> float:
+        total_bytes = (m * k + k * n + m * n) * bytes_per_elem
         return total_bytes / elapsed_sec / 1e9 if elapsed_sec > 0 else 0.0
 
     def _log_status(it: int, start_t: float, iter_time: float) -> None:
         nonlocal last_temp, last_beat
-        now = time.time()
+        now = time.monotonic()
         if now - last_temp < 10:
             return
         temp, power, sm_clk, mem_clk, used_gb, total_gb, used_ratio = _get_status()
@@ -572,7 +585,7 @@ def benchmark(
                 max_metrics['mem_clock'] = mem_clk
             if used_ratio > max_metrics['mem_used_ratio']:
                 max_metrics['mem_used_ratio'] = used_ratio
-            bw = _effective_bw(matrix_size, matrix_size, matrix_size, elem_bytes, iter_time, 1)
+            bw = _effective_bw(matrix_size, matrix_size, matrix_size, elem_bytes, iter_time)
             if bw > max_metrics['effective_bw']:
                 max_metrics['effective_bw'] = bw
             elapsed = now - start_t
@@ -603,23 +616,31 @@ def benchmark(
         return 0, f"OOM: {e}", {}
 
     try:
-        start = time.time()
+        start = time.monotonic()
         it = 0
-        while time.time() - start < duration:
-            iter_start = time.time()
+        while time.monotonic() - start < duration:
+            iter_start = time.monotonic()
             c = dispatch_matmul(precision, a, b)
             torch.cuda.synchronize()
-            iter_time = time.time() - iter_start
+            iter_time = time.monotonic() - iter_start
             it += 1
             _log_status(it, start, iter_time)
-        elapsed = time.time() - start
+        elapsed = time.monotonic() - start
     except Exception as e:
         logger.error(f"测试异常: {e}\n{traceback.format_exc()}")
         return 0, str(e), max_metrics
     finally:
         if monitor:
             monitor.stop()
-        del a, b
+        # 安全删除 a,b（OOM 路径可能未定义）
+        try:
+            del a
+        except NameError:
+            pass
+        try:
+            del b
+        except NameError:
+            pass
         try:
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
@@ -682,6 +703,7 @@ def save_results_json(results: Dict[str, Dict], support_status: Dict[str, str],
         output['results'][prec] = {
             'tflops': r['tflops'],
             'status': r['status'],
+            'matrix_size': r.get('matrix_size'),
             'max_metrics': r.get('max_metrics', {}),
         }
     try:
@@ -835,7 +857,7 @@ if __name__ == '__main__':
         else:
             ms = auto_scale_matrix(prec, device, target_time=3.0)
         tflops, status, metrics = benchmark(prec, device, args.duration, handle, bus_width, phys_idx_final, ms)
-        results[prec] = {'tflops': tflops, 'status': status, 'max_metrics': metrics}
+        results[prec] = {'tflops': tflops, 'status': status, 'max_metrics': metrics, 'matrix_size': ms}
         if status == "成功":
             logger.info(f"{prec.upper()}: {tflops:.2f} TFLOPS")
         else:
