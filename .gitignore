@@ -23,3 +23,9 @@ local_settings.sh
 
 # opencode-lcm 数据库
 .lcm/
+
+# 用户本地配置
+Users/
+
+# 旧版备份
+old/
