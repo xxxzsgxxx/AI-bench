@@ -91,8 +91,8 @@ def print_reference_specs(gpu_name: str) -> None:
 def compute_capability_to_cores(major: int, minor: int, device: torch.device) -> int:
     mp = torch.cuda.get_device_properties(device).multi_processor_count
     # A100 (compute capability 8.0) 每 SM 有 64 个 CUDA 核心
-    # Ada Lovelace (8.6, 8.7), H100 (8.9), Blackwell (9.0) 每 SM 128 核心
-    mapping = {80: 64, 86: 128, 87: 128, 89: 128, 90: 128}
+    # Ada Lovelace (8.6, 8.7), H100 (8.9), Blackwell (9.0, 12.0) 每 SM 128 核心
+    mapping = {80: 64, 86: 128, 87: 128, 89: 128, 90: 128, 120: 128}
     return mp * mapping.get(10 * major + minor, 64)
 
 
@@ -223,14 +223,62 @@ def print_extended_env(info: Dict[str, Any]) -> None:
 
 
 # ================= FP8/BF8 矩阵乘法 =================
-def fp8_matmul(a_fp8: torch.Tensor, b_fp8: torch.Tensor) -> torch.Tensor:
-    if not hasattr(torch, '_scaled_mm'):
-        raise RuntimeError("torch._scaled_mm 不可用，请升级 PyTorch (>=2.2)")
-    scale = torch.tensor(1.0, device=a_fp8.device, dtype=torch.float32)
-    result = torch._scaled_mm(a_fp8, b_fp8, scale_a=scale, scale_b=scale)
+def _try_scaled_mm(
+    a_fp8: torch.Tensor,
+    b_fp8: torch.Tensor,
+    *,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """调用 torch._scaled_mm，用 1D scale tensor 尝试。
+    
+    一些架构（如 Blackwell SM 12.0）需要 1D scale 而非 0D scalar，
+    或需要显式指定 out_dtype。
+    """
+    scale = torch.tensor([1.0], device=a_fp8.device, dtype=torch.float32)
+    kwargs: Dict[str, Any] = {'scale_a': scale, 'scale_b': scale}
+    if out_dtype is not None:
+        kwargs['out_dtype'] = out_dtype
+    result = torch._scaled_mm(a_fp8, b_fp8, **kwargs)
     if isinstance(result, tuple):
         return result[0]
     return result
+
+
+# FP8 GEMM 候选策略：(fp8_dtype, out_dtype_or_None)
+# Blackwell (SM 12.0) 可能对 float8_e4m3fnuz 或显式 out_dtype 有需求
+_FP8_GEMM_STRATEGIES: List[Tuple[Any, Optional[Any]]] = [
+    (torch.float8_e4m3fn, None),
+    (torch.float8_e4m3fn, torch.float16),
+    (torch.float8_e4m3fn, torch.bfloat16),
+]
+# 如果有 fnuz 变体也加入（CUDA 12.x 某些配置）
+for _fnuz_type_name in ('float8_e4m3fnuz',):
+    _t = getattr(torch, _fnuz_type_name, None)
+    if _t is not None:
+        _FP8_GEMM_STRATEGIES.append((_t, None))
+        _FP8_GEMM_STRATEGIES.append((_t, torch.float16))
+
+
+def fp8_matmul(a_fp8: torch.Tensor, b_fp8: torch.Tensor, *, fp8_type: Any = None) -> torch.Tensor:
+    """FP8 GEMM 入口。fp8_type 为 None 时自动尝试所有策略。"""
+    if not hasattr(torch, '_scaled_mm'):
+        raise RuntimeError("torch._scaled_mm 不可用，请升级 PyTorch (>=2.2)")
+    if fp8_type is not None:
+        # 调用方指定了具体类型，直接使用
+        return _try_scaled_mm(a_fp8, b_fp8)
+    # 自动尝试所有策略
+    last_err: Optional[str] = None
+    for fp8_dtype, out_dtype in _FP8_GEMM_STRATEGIES:
+        try:
+            a_q = a_fp8.to(fp8_dtype)
+            b_q = b_fp8.to(fp8_dtype)
+            result = _try_scaled_mm(a_q, b_q, out_dtype=out_dtype)
+            logger.debug(f"FP8 GEMM 策略成功: {fp8_dtype}{' out_dtype='+str(out_dtype) if out_dtype else ''}")
+            return result
+        except (RuntimeError, AttributeError) as e:
+            last_err = str(e)
+            continue
+    raise RuntimeError(f"所有 FP8 GEMM 策略均失败: {last_err}")
 
 
 def dispatch_matmul(
@@ -240,13 +288,14 @@ def dispatch_matmul(
 ) -> torch.Tensor:
     """Unified GEMM dispatch for all supported precision types."""
     if precision == 'fp8':
-        a_q = a.to(torch.float8_e4m3fn)
-        b_q = b.to(torch.float8_e4m3fn)
-        return fp8_matmul(a_q, b_q)
+        # 传入原始 float32 张量，fp8_matmul 内部自动尝试多种策略
+        return fp8_matmul(a, b)
     elif precision == 'bf8':
+        # e5m2 格式不原生支持 GEMM（Hopper/Blackwell 均如此）
+        # 回退到高精度计算
         a_q = a.to(torch.float8_e5m2)
         b_q = b.to(torch.float8_e5m2)
-        return fp8_matmul(a_q, b_q)
+        return (a_q.float() @ b_q.float())
     elif precision == 'int8':
         a_q = a.to(torch.int8)
         b_q = b.to(torch.int8)
@@ -278,9 +327,12 @@ def check_precision_support(prec: str, dev: torch.device) -> Tuple[bool, str, bo
         return True, f"硬件支持 (计算能力 {cap})，PyTorch 无原生 GEMM 接口", False
 
     if prec in ('fp8', 'bf8'):
-        # fp8/bf8 require torch._scaled_mm + native float8 types
         if not (hasattr(torch, 'float8_e4m3fn') and hasattr(torch, '_scaled_mm')):
             return False, "PyTorch 版本过低，缺少 float8/_scaled_mm", False
+        if prec == 'bf8':
+            # e5m2 GEMM 在所有架构上均不受原生支持，回退到高精度计算
+            return True, "硬件支持但 e5m2 GEMM 无原生支持 (使用高精度回退)", False
+        # FP8: 使用 native _scaled_mm，自动尝试多种策略
         try:
             torch.manual_seed(GLOBAL_SEED)
             torch.cuda.manual_seed_all(GLOBAL_SEED)
