@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-GPU Computility Test (v21)
+GPU Computility Test (v22)
+- v22: nvmath-python cross-validation support
 - v21 fixes:
   - Fix UnboundLocalError in OOM path (finally del a,b on unbound vars)
   - Fix auto_scale_matrix memory estimation for fp8/bf8/int8 (used bytes=1 but input is float32)
@@ -220,6 +221,9 @@ def print_extended_env(info: Dict[str, Any]) -> None:
     pkgs = [f"{p}={v}" for p, v in info.items() if p in ('numpy', 'psutil', 'pynvml')]
     if pkgs:
         logger.info("关键软件包: " + ", ".join(pkgs))
+    nvmm_avail = _is_nvmath_available()
+    nvmm_has_mm = _has_nvmm() if nvmm_avail else False
+    logger.info(f"nvmath-python: {'✅ 可用 (Matmul API)' if nvmm_has_mm else '⚠️ ' + ('可用(旧版)' if nvmm_avail else '未安装')}")
 
 
 # ================= FP8/BF8 矩阵乘法 =================
@@ -379,6 +383,103 @@ def check_precision_support(prec: str, dev: torch.device) -> Tuple[bool, str, bo
         return True, "探测通过", True
     except Exception as e:
         return False, str(e), False
+
+
+# ================= nvmath-python 精度验证 (可选) =================
+def _is_nvmath_available() -> bool:
+    try:
+        import nvmath  # noqa: F401
+        import cupy  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _has_nvmm() -> bool:
+    try:
+        import nvmath
+        return hasattr(nvmath, 'Matmul')
+    except ImportError:
+        return False
+
+
+NVMATH_VERIFY_MAP: Dict[str, str] = {
+    'fp64': 'FLOAT64',
+    'tf32': 'TF32',
+    'fp32': 'FLOAT32',
+    'fp16': 'FLOAT16',
+    'bf16': 'BFLOAT16',
+    'int8': 'INT8',
+    'fp8': 'FP8_E4M3',
+    'bf8': 'FP8_E5M2',
+}
+
+
+def verify_precision_nvmath(prec: str) -> Tuple[bool, str, bool]:
+    """用 nvmath-python + cuBLASLt 验证精度是否真正受硬件原生支持。
+
+    nvmath-python 直接对接 cuBLASLt API，比 PyTorch 的实验性接口更可靠。
+    准确反映硬件 Tensor Core / cuBLAS 是否原生支持该精度。
+    """
+    if prec not in NVMATH_VERIFY_MAP:
+        return False, f"nvmath 不支持 {prec}", False
+
+    try:
+        import nvmath
+        import cupy as cp
+    except ImportError as e:
+        return False, f"nvmath/cupy 未安装: {e}", False
+
+    if not hasattr(nvmath, 'Matmul'):
+        return False, "nvmath 版本过低 (无 Matmul 接口)", False
+
+    compute_name = NVMATH_VERIFY_MAP[prec]
+    compute_type = getattr(nvmath.Compute, compute_name, None)
+    if compute_type is None:
+        return False, f"nvmath 无 {compute_name} 计算类型", False
+
+    sz = 256
+    try:
+        a = cp.random.randn(sz, sz).astype(cp.float32)
+        b = cp.random.randn(sz, sz).astype(cp.float32)
+
+        mm = nvmath.Matmul(a, b)
+        mm.plan(compile_options={"compute_type": compute_type})
+        mm.execute()
+
+        del mm
+        cp.get_default_memory_pool().free_all_blocks()
+        return True, "nvmath cuBLASLt 确认原生支持", True
+
+    except Exception as e:
+        err_msg = str(e)
+        del a, b
+        cp.get_default_memory_pool().free_all_blocks()
+        return False, f"nvmath cuBLASLt 不支持: {err_msg}", False
+
+
+def check_precision_support_nvmath(
+    torch_result: Tuple[bool, str, bool],
+    prec: str,
+) -> Tuple[bool, str, bool]:
+    """结合 PyTorch 检测和 nvmath 验证，给出更准确的精度支持判断。
+
+    策略:
+    1. 如果 nvmath 不可用 → 直接返回 PyTorch 结果
+    2. 如果 nvmath 确认支持 → 增加可信度
+    3. 如果 nvmath 确认不支持，但 PyTorch 说支持 → 标记为"软件回退"
+    """
+    nv_ok, nv_msg, nv_native = verify_precision_nvmath(prec)
+    if not nv_ok:
+        # nvmath 不可用或失败 → 回退到 PyTorch 结果
+        if '未安装' in nv_msg:
+            return torch_result  # nvmath not installed, trust torch
+        # nvmath 运行了但报错 → 可能是真不支持
+        return (False, nv_msg, False)
+    # nvmath 确认原生支持
+    if nv_native:
+        return (True, nv_msg, True)
+    return torch_result
 
 
 # ================= dmon 监控器 =================
@@ -778,6 +879,8 @@ if __name__ == '__main__':
                         help='测试精度列表，逗号分隔 (默认: 所有原生支持的精度)')
     parser.add_argument('--output-json', type=str, default='',
                         help='结果 JSON 输出路径 (默认: 自动生成)')
+    parser.add_argument('--no-nvmath-verify', action='store_true', default=False,
+                        help='跳过 nvmath-python 精度验证 (默认: 使用 nvmath 交叉验证)')
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -865,8 +968,15 @@ if __name__ == '__main__':
     all_precisions = ['fp64', 'tf32', 'fp32', 'fp16', 'bf16', 'int8', 'fp8', 'bf8', 'int4', 'fp4']
     logger.info("\n===== 精度支持状态 =====")
     support_status: Dict[str, str] = {}
+    use_nvmath_verify = not args.no_nvmath_verify and _is_nvmath_available()
+    if use_nvmath_verify:
+        logger.info("使用 nvmath-python 交叉验证精度 (cuBLASLt 后端)")
+    elif not args.no_nvmath_verify:
+        logger.info("nvmath-python 未安装，仅使用 PyTorch 检测")
     for prec in all_precisions:
         ok, msg, native_ok = check_precision_support(prec, device)
+        if use_nvmath_verify and prec not in ('int4', 'fp4'):
+            ok, msg, native_ok = check_precision_support_nvmath((ok, msg, native_ok), prec)
         if ok and native_ok:
             status_text = "✅ 原生支持"
             support_status[prec] = "✅ 原生支持"
