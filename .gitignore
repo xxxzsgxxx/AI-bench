@@ -20,3 +20,6 @@ sysinfo_*
 
 # 本地调试文件
 local_settings.sh
+
+# opencode-lcm 数据库
+.lcm/
