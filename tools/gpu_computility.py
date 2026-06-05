@@ -221,9 +221,12 @@ def print_extended_env(info: Dict[str, Any]) -> None:
     pkgs = [f"{p}={v}" for p, v in info.items() if p in ('numpy', 'psutil', 'pynvml')]
     if pkgs:
         logger.info("关键软件包: " + ", ".join(pkgs))
-    nvmm_avail = _is_nvmath_available()
-    nvmm_has_mm = _has_nvmm() if nvmm_avail else False
-    logger.info(f"nvmath-python: {'✅ 可用 (Matmul API)' if nvmm_has_mm else '⚠️ ' + ('可用(旧版)' if nvmm_avail else '未安装')}")
+    nvmm_avail, nvmm_reason = _is_nvmath_available()
+    if nvmm_avail:
+        nvmm_has_mm, _ = _has_nvmm()
+        logger.info(f"nvmath-python: {'✅ 可用 (Matmul API)' if nvmm_has_mm else '⚠️ 可用(旧版)'}")
+    else:
+        logger.info(f"nvmath-python: ⚠️ {nvmm_reason}")
 
 
 # ================= FP8/BF8 矩阵乘法 =================
@@ -249,18 +252,14 @@ def _try_scaled_mm(
 
 
 # FP8 GEMM 候选策略：(fp8_dtype, out_dtype_or_None)
-# Blackwell (SM 12.0) 可能对 float8_e4m3fnuz 或显式 out_dtype 有需求
+# Blackwell (SM 12.0) 可能对显式 out_dtype 有需求
+# 注意: float8_e4m3fnuz 在许多 PyTorch 版本上是 stub 类型，
+# 执行 .to() 时触发 CUDADataType 断言失败，因此不加入列表。
 _FP8_GEMM_STRATEGIES: List[Tuple[Any, Optional[Any]]] = [
     (torch.float8_e4m3fn, None),
     (torch.float8_e4m3fn, torch.float16),
     (torch.float8_e4m3fn, torch.bfloat16),
 ]
-# 如果有 fnuz 变体也加入（CUDA 12.x 某些配置）
-for _fnuz_type_name in ('float8_e4m3fnuz',):
-    _t = getattr(torch, _fnuz_type_name, None)
-    if _t is not None:
-        _FP8_GEMM_STRATEGIES.append((_t, None))
-        _FP8_GEMM_STRATEGIES.append((_t, torch.float16))
 
 
 def fp8_matmul(a_fp8: torch.Tensor, b_fp8: torch.Tensor, *, fp8_type: Any = None) -> torch.Tensor:
@@ -386,21 +385,31 @@ def check_precision_support(prec: str, dev: torch.device) -> Tuple[bool, str, bo
 
 
 # ================= nvmath-python 精度验证 (可选) =================
-def _is_nvmath_available() -> bool:
+def _is_nvmath_available() -> Tuple[bool, str]:
+    """返回 (可用性, 详细原因)。区分 nvmath 和 cupy 缺失。"""
+    missing = []
     try:
         import nvmath  # noqa: F401
-        import cupy  # noqa: F401
-        return True
     except ImportError:
-        return False
+        missing.append('nvmath')
+    try:
+        import cupy  # noqa: F401
+    except ImportError:
+        missing.append('cupy')
+    if not missing:
+        return True, ""
+    return False, f"缺失模块: {'、'.join(missing)}"
 
 
-def _has_nvmm() -> bool:
+def _has_nvmm() -> Tuple[bool, str]:
+    """检查 nvmath Matmul API 是否存在。"""
     try:
         import nvmath
-        return hasattr(nvmath, 'Matmul')
+        if hasattr(nvmath, 'Matmul'):
+            return True, ""
+        return False, "nvmath 无 Matmul API (版本过旧)"
     except ImportError:
-        return False
+        return False, "nvmath 未安装"
 
 
 NVMATH_VERIFY_MAP: Dict[str, str] = {
@@ -968,7 +977,8 @@ if __name__ == '__main__':
     all_precisions = ['fp64', 'tf32', 'fp32', 'fp16', 'bf16', 'int8', 'fp8', 'bf8', 'int4', 'fp4']
     logger.info("\n===== 精度支持状态 =====")
     support_status: Dict[str, str] = {}
-    use_nvmath_verify = not args.no_nvmath_verify and _is_nvmath_available()
+    _nvmath_avail, _ = _is_nvmath_available()
+    use_nvmath_verify = not args.no_nvmath_verify and _nvmath_avail
     if use_nvmath_verify:
         logger.info("使用 nvmath-python 交叉验证精度 (cuBLASLt 后端)")
     elif not args.no_nvmath_verify:
