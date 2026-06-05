@@ -278,8 +278,9 @@ def fp8_matmul(a_fp8: torch.Tensor, b_fp8: torch.Tensor, *, fp8_type: Any = None
             result = _try_scaled_mm(a_q, b_q, out_dtype=out_dtype)
             logger.debug(f"FP8 GEMM 策略成功: {fp8_dtype}{' out_dtype='+str(out_dtype) if out_dtype else ''}")
             return result
-        except (RuntimeError, AttributeError) as e:
+        except Exception as e:
             last_err = str(e)
+            logger.debug(f"FP8 GEMM 策略失败: {fp8_dtype}/{out_dtype} -> {e}")
             continue
     raise RuntimeError(f"所有 FP8 GEMM 策略均失败: {last_err}")
 
@@ -292,7 +293,12 @@ def dispatch_matmul(
     """Unified GEMM dispatch for all supported precision types."""
     if precision == 'fp8':
         # 传入原始 float32 张量，fp8_matmul 内部自动尝试多种策略
-        return fp8_matmul(a, b)
+        # 如果所有 FP8 策略均失败（如 Blackwell 上 _scaled_mm 不可用），回退到 float16 高精度计算
+        try:
+            return fp8_matmul(a, b)
+        except (RuntimeError, AssertionError, AttributeError) as e:
+            logger.warning(f"FP8 GEMM 原生路径失败 ({e})，回退到 float16 计算")
+            return torch.mm(a.to(torch.float16), b.to(torch.float16))
     elif precision == 'bf8':
         # e5m2 格式不原生支持 GEMM（Hopper/Blackwell 均如此）
         # 回退到高精度计算
@@ -347,7 +353,12 @@ def check_precision_support(prec: str, dev: torch.device) -> Tuple[bool, str, bo
             torch.cuda.empty_cache()
             return True, "原生 Tensor Core 支持", True
         except Exception as e:
-            return False, f"原生 {prec.upper()} 失败: {e}", False
+            err_msg = str(e)
+            # Blackwell (cap>=9.0) 上 _scaled_mm 可能存在 API 兼容性问题
+            # 此时硬件支持 FP8，但 PyTorch 接口不兼容，不等于"不支持"
+            if cap >= 9.0:
+                return True, f"Blackwell FP8 Tensor Core 支持但 PyTorch API 不兼容 ({err_msg[:80]})", False
+            return False, f"原生 {prec.upper()} 失败: {err_msg}", False
 
     if prec == 'int8':
         if not hasattr(torch, '_int_mm'):
