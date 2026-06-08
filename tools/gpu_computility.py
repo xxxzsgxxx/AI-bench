@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
 """
-GPU Computility Test (v22)
+GPU Computility Test (v34)
+- v34: auto-install missing deps, improved report, ref GPU specs updated
 - v22: nvmath-python cross-validation support
-- v21 fixes:
-  - Fix UnboundLocalError in OOM path (finally del a,b on unbound vars)
-  - Fix auto_scale_matrix memory estimation for fp8/bf8/int8 (used bytes=1 but input is float32)
-  - Fix compute_capability_to_cores SM 8.0 (A100) returning 128 instead of 64 cores/SM
-  - Fix tf32 precision detection (allow_tf32 not set during detection)
-  - Replace time.time() with time.monotonic() for robust duration timing
-  - Cache get_phys_idx_from_torch results (avoid repeated subprocess calls)
-  - Remove dead it_cnt parameter from _effective_bw
-  - Fix dmon header line parsing (was dead code, never parsed column names)
-  - Include matrix_size in JSON output
+- v21 fixes: 9 bugfixes (OOM del, fp8 mem, A100 cores, tf32, monotonic, cache, bw, dmon, JSON)
 """
 from __future__ import annotations
 
@@ -47,6 +39,35 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 GLOBAL_SEED = 42
 
+# ================= 自动安装缺失依赖 =================
+def _ensure_module(module_name: str, import_name: Optional[str] = None,
+                   package_name: Optional[str] = None) -> bool:
+    """尝试导入模块，失败时自动 pip 安装后重试。返回是否成功导入。"""
+    pip_name = package_name or module_name
+    check_name = import_name or module_name
+    try:
+        __import__(check_name)
+        return True
+    except ImportError:
+        pass
+    logger.warning(f"缺少 {check_name}，正在自动安装 {pip_name}...")
+    try:
+        subprocess.check_call(
+            [sys.executable, '-m', 'pip', 'install', pip_name, '-q'],
+            stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        )
+        try:
+            __import__(check_name)
+            logger.info(f"{check_name} 安装成功")
+            return True
+        except ImportError:
+            logger.warning(f"{check_name} 安装后仍无法导入，请手动安装：pip install {pip_name}")
+            return False
+    except Exception as e:
+        logger.warning(f"自动安装 {pip_name} 失败: {e}，请手动安装")
+        return False
+
+
 # ================= 精度信息矩阵 =================
 PRECISION_INFO: Dict[str, Dict[str, Any]] = {
     'fp64': {'min_cap': 3.0, 'bytes': 8, 'dtype': torch.float64, 'tensor_core': False},
@@ -63,19 +84,25 @@ PRECISION_INFO: Dict[str, Dict[str, Any]] = {
 
 # ================= 参考 GPU 规格 =================
 REFERENCE_GPU_SPECS: Dict[str, Dict[str, Any]] = {
-    "NVIDIA GeForce RTX 5090 D v2":                 {"cuda_cores": 16384, "tensor_cores": 512, "rt_cores": 128, "bus_width": 384},
-    "NVIDIA GeForce RTX 5090":                      {"cuda_cores": 21760, "tensor_cores": 680, "rt_cores": 170, "bus_width": 512},
-    "NVIDIA RTX 6000D":                             {"cuda_cores": 18176, "tensor_cores": 568, "rt_cores": 142, "bus_width": 384},
-    "NVIDIA RTX 5000 Blackwell":                    {"cuda_cores": 10752, "tensor_cores": 336, "rt_cores": 84, "bus_width": 384},
-    "NVIDIA RTX PRO 6000 Blackwell Server Edition": {"cuda_cores": 24064, "tensor_cores": 752, "rt_cores": 188, "bus_width": 512},
-    "NVIDIA RTX 4090":                              {"cuda_cores": 16384, "tensor_cores": 512, "rt_cores": 128, "bus_width": 384},
-    "NVIDIA RTX 4090D":                             {"cuda_cores": 14592, "tensor_cores": 456, "rt_cores": 114, "bus_width": 384},
-    "NVIDIA H100":                                  {"cuda_cores": 16896, "tensor_cores": 528, "bus_width": 5120},
-    "NVIDIA H200":                                  {"cuda_cores": 16896, "tensor_cores": 528, "bus_width": 5120},
-    "NVIDIA H800":                                  {"cuda_cores": 16896, "tensor_cores": 528, "bus_width": 5120},
-    "NVIDIA H20":                                   {"cuda_cores": 14592, "tensor_cores": 456, "bus_width": 5120},
-    "NVIDIA B200":                                  {"cuda_cores": 20480, "tensor_cores": 640, "bus_width": 8192},
-    "NVIDIA B300":                                  {"cuda_cores": 25600, "tensor_cores": 800, "bus_width": 8192},
+    "NVIDIA GeForce RTX 5090 D v2":                 {"cuda_cores": 16384, "tensor_cores": 512, "rt_cores": 128, "bus_width": 384, "tdp": 600},
+    "NVIDIA GeForce RTX 5090":                      {"cuda_cores": 21760, "tensor_cores": 680, "rt_cores": 170, "bus_width": 512, "tdp": 575},
+    "NVIDIA RTX 6000D":                             {"cuda_cores": 18176, "tensor_cores": 568, "rt_cores": 142, "bus_width": 384, "tdp": 525},
+    "NVIDIA RTX 5000 Blackwell":                    {"cuda_cores": 10752, "tensor_cores": 336, "rt_cores": 84, "bus_width": 384, "tdp": 300},
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": {"cuda_cores": 24064, "tensor_cores": 752, "rt_cores": 188, "bus_width": 512, "tdp": 450},
+    "NVIDIA RTX 4090":                              {"cuda_cores": 16384, "tensor_cores": 512, "rt_cores": 128, "bus_width": 384, "tdp": 450},
+    "NVIDIA RTX 4090D":                             {"cuda_cores": 14592, "tensor_cores": 456, "rt_cores": 114, "bus_width": 384, "tdp": 425},
+    "NVIDIA RTX 4080 SUPER":                        {"cuda_cores": 10240, "tensor_cores": 320, "rt_cores": 80, "bus_width": 256, "tdp": 320},
+    "NVIDIA RTX 5080":                              {"cuda_cores": 10752, "tensor_cores": 336, "rt_cores": 84, "bus_width": 256, "tdp": 360},
+    "NVIDIA RTX 5070 Ti":                           {"cuda_cores": 8960, "tensor_cores": 280, "rt_cores": 70, "bus_width": 256, "tdp": 300},
+    "NVIDIA H100":                                  {"cuda_cores": 16896, "tensor_cores": 528, "bus_width": 5120, "tdp": 700},
+    "NVIDIA H200":                                  {"cuda_cores": 16896, "tensor_cores": 528, "bus_width": 5120, "tdp": 700},
+    "NVIDIA H800":                                  {"cuda_cores": 16896, "tensor_cores": 528, "bus_width": 5120, "tdp": 700},
+    "NVIDIA H20":                                   {"cuda_cores": 14592, "tensor_cores": 456, "bus_width": 5120, "tdp": 400},
+    "NVIDIA B200":                                  {"cuda_cores": 20480, "tensor_cores": 640, "bus_width": 8192, "tdp": 1000},
+    "NVIDIA B300":                                  {"cuda_cores": 25600, "tensor_cores": 800, "bus_width": 8192, "tdp": 1200},
+    "NVIDIA A100 80GB PCIe":                        {"cuda_cores": 6912, "tensor_cores": 432, "bus_width": 5120, "tdp": 300},
+    "NVIDIA A100 80GB SXM":                         {"cuda_cores": 6912, "tensor_cores": 432, "bus_width": 5120, "tdp": 400},
+    "NVIDIA A800 80GB":                             {"cuda_cores": 6912, "tensor_cores": 432, "bus_width": 5120, "tdp": 400},
 }
 
 
